@@ -5,6 +5,7 @@ import { AppService } from './app.service';
 import { StellarModule } from './stellar/stellar.module';
 import { CreditsModule } from './credits/credits.module';
 import { ProjectsModule } from './projects/projects.module';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { ProjectsModule } from './projects/projects.module';
     StellarModule,
     CreditsModule,
     ProjectsModule,
+    AuthModule,
   ],
   controllers: [AppController],
   providers: [AppService],
