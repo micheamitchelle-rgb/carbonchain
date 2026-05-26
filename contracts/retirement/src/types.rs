@@ -20,7 +20,6 @@ pub struct RetirementRecord {
 pub enum DataKey {
     Retirement(BytesN<32>),
     AccountRetirements(Address),
-    Nonce(Address),
     Admin,
-    PendingAdmin,
+    Paused,
 }

@@ -15,6 +15,6 @@ pub enum CarbonChainError {
     InsufficientBalance = 108,
     Overflow = 109,
     InvalidTonnes = 110,
-    InvalidNonce = 111,
-    NoPendingAdmin = 112,
+    InvalidAdmin = 111,
+    ContractPaused = 112,
 }

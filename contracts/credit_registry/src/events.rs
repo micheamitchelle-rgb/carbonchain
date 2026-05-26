@@ -24,3 +24,11 @@ pub fn verifier_removed(env: &Env, admin: Address, verifier: Address) {
     let topics = (symbol_short!("ver_rm"), admin);
     env.events().publish(topics, verifier);
 }
+
+pub fn contract_paused(env: &Env, admin: Address) {
+    env.events().publish((symbol_short!("paused"),), admin);
+}
+
+pub fn contract_unpaused(env: &Env, admin: Address) {
+    env.events().publish((symbol_short!("unpaused"),), admin);
+}

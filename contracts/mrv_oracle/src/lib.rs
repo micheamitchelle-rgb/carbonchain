@@ -28,22 +28,19 @@ pub enum DataKey {
     Latest(String),
     /// Full history per project (Vec<MrvDataPoint>).
     History(String),
-    /// Per-address nonce for replay protection.
-    Nonce(Address),
-    /// Pending admin for two-step transfer.
-    PendingAdmin,
+    /// Pause flag.
+    Paused,
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum OracleError {
-    NotInitialized   = 119,
-    Unauthorized     = 120,
+    NotInitialized     = 119,
+    Unauthorized       = 120,
     AlreadyInitialized = 121,
-    Overflow         = 122,
-    InvalidNonce     = 123,
-    NoPendingAdmin   = 124,
+    Overflow           = 122,
+    ContractPaused     = 123,
 }
 
 // Maximum MRV history entries retained per project (ring-buffer eviction).
@@ -70,7 +67,33 @@ impl MrvOracle {
         Ok(())
     }
 
-    pub fn register_oracle(env: Env, admin: Address, oracle: Address, nonce: u64) -> Result<(), OracleError> {
+    // ── Pause / Unpause ──────────────────────────────────────────────────────
+
+    pub fn pause(env: Env, admin: Address) -> Result<(), OracleError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("paused"),), admin);
+        Ok(())
+    }
+
+    pub fn unpause(env: Env, admin: Address) -> Result<(), OracleError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("unpaused"),), admin);
+        Ok(())
+    }
+
+    pub fn paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    }
+
+    // ── Oracle management ────────────────────────────────────────────────────
+
+    /// Register an oracle address. Returns `true` if newly added, `false` if
+    /// already registered. Emits `oracle_new` only on first registration and
+    /// `oracle_dup` when the oracle was already present, so callers can
+    /// distinguish the two cases from on-chain events.
+    pub fn register_oracle(env: Env, admin: Address, oracle: Address) -> Result<bool, OracleError> {
         Self::require_admin(&env, &admin)?;
         if !Self::consume_nonce(&env, &admin, nonce) {
             return Err(OracleError::InvalidNonce);
@@ -79,11 +102,15 @@ impl MrvOracle {
             .storage().instance()
             .get(&DataKey::OracleSet)
             .unwrap_or_else(|| Vec::new(&env));
-        if !set.contains(&oracle) {
-            set.push_back(oracle);
-            env.storage().instance().set(&DataKey::OracleSet, &set);
+        if set.contains(&oracle) {
+            // Already registered — emit a distinct event so callers know.
+            env.events().publish((symbol_short!("orc_dup"),), oracle);
+            return Ok(false);
         }
-        Ok(())
+        set.push_back(oracle.clone());
+        env.storage().instance().set(&DataKey::OracleSet, &set);
+        env.events().publish((symbol_short!("orc_new"),), oracle);
+        Ok(true)
     }
 
     /// Submit a new MRV reading for a project.
@@ -95,6 +122,9 @@ impl MrvOracle {
         tonnes: i128,
         nonce: u64,
     ) -> Result<bool, OracleError> {
+        if Self::is_paused(&env) {
+            return Err(OracleError::ContractPaused);
+        }
         oracle.require_auth();
         if !Self::is_oracle(&env, &oracle) {
             return Err(OracleError::Unauthorized);
@@ -201,6 +231,10 @@ impl MrvOracle {
             .get(&DataKey::OracleSet)
             .unwrap_or_else(|| Vec::new(env));
         set.contains(oracle)
+    }
+
+    fn is_paused(env: &Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
     }
 
     /// Returns true if `new_tonnes` deviates more than 20% from the last reading.
@@ -323,5 +357,85 @@ mod tests {
         let history = client.get_history(&proj);
         assert_eq!(history.len(), MAX_HISTORY);
         assert_eq!(history.get(0).unwrap().tonnes, 1_000);
+    }
+
+    // ── register_oracle duplicate tests ─────────────────────────────────────
+
+    #[test]
+    fn test_register_oracle_returns_true_for_new() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(MrvOracle, ());
+        let client = MrvOracleClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin);
+        let newly_added = client.register_oracle(&admin, &oracle);
+        assert!(newly_added);
+    }
+
+    #[test]
+    fn test_register_oracle_returns_false_for_duplicate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(MrvOracle, ());
+        let client = MrvOracleClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_oracle(&admin, &oracle);
+        // Second registration of the same oracle must return false.
+        let newly_added = client.register_oracle(&admin, &oracle);
+        assert!(!newly_added);
+    }
+
+    #[test]
+    fn test_register_oracle_duplicate_emits_oracle_dup_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(MrvOracle, ());
+        let client = MrvOracleClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        client.initialize(&admin);
+        client.register_oracle(&admin, &oracle);
+        // Clear events so we only see the duplicate-registration event.
+        let events_before = env.events().all().len();
+        client.register_oracle(&admin, &oracle);
+        let events_after = env.events().all();
+        // One new event must have been emitted.
+        assert_eq!(events_after.len(), events_before + 1);
+        let (_, topics, _): (_, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val) =
+            events_after.get(events_before).unwrap();
+        let expected: soroban_sdk::Val = symbol_short!("orc_dup").into();
+        assert_eq!(topics.get(0).unwrap(), expected);
+    }
+
+    // ── Pause tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pause_blocks_update_mrv_data() {
+        let (env, client, admin, oracle) = setup();
+        client.pause(&admin);
+        assert!(client.paused());
+        let proj = String::from_str(&env, "PROJ-001");
+        assert!(client.try_update_mrv_data(&oracle, &proj, &1_000_000).is_err());
+    }
+
+    #[test]
+    fn test_unpause_restores_update_mrv_data() {
+        let (env, client, admin, oracle) = setup();
+        client.pause(&admin);
+        client.unpause(&admin);
+        assert!(!client.paused());
+        let proj = String::from_str(&env, "PROJ-001");
+        assert!(client.try_update_mrv_data(&oracle, &proj, &1_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_pause() {
+        let (env, client, _, _) = setup();
+        let rando = Address::generate(&env);
+        assert!(client.try_pause(&rando).is_err());
     }
 }
