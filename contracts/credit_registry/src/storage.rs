@@ -50,3 +50,11 @@ pub fn get_credits_by_project(env: &Env, project_id: &String) -> Vec<BytesN<32>>
         .get(&DataKey::ProjectCredits(project_id.clone()))
         .unwrap_or_else(|| Vec::new(env))
 }
+
+pub fn set_retirement_contract(env: &Env, addr: &Address) {
+    env.storage().instance().set(&DataKey::RetirementContract, addr);
+}
+
+pub fn get_retirement_contract(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::RetirementContract)
+}

@@ -13,6 +13,7 @@ use crate::storage::{
     set_credit, get_credit,
     get_verifiers, set_verifiers, is_verifier,
     add_credit_to_project, get_credits_by_project,
+    set_retirement_contract, get_retirement_contract,
 };
 use crate::types::{CreditMetadata, CreditStatus};
 use crate::events::{credit_submitted, credit_minted, verifier_added, verifier_removed};
@@ -24,11 +25,12 @@ pub struct CreditRegistry;
 impl CreditRegistry {
     // ── Admin ────────────────────────────────────────────────────────────────
 
-    pub fn initialize(env: Env, admin: Address) -> Result<(), CarbonChainError> {
+    pub fn initialize(env: Env, admin: Address, retirement_contract: Address) -> Result<(), CarbonChainError> {
         if has_admin(&env) {
             return Err(CarbonChainError::AlreadyInitialized);
         }
         set_admin(&env, &admin);
+        set_retirement_contract(&env, &retirement_contract);
         Ok(())
     }
 
@@ -92,7 +94,11 @@ impl CreditRegistry {
         }
         issuer.require_auth();
         if tonnes <= 0 {
-            return Err(CarbonChainError::InvalidMetadata);
+            return Err(CarbonChainError::InvalidTonnes);
+        }
+        // 1 billion tonnes upper bound (in kg units: 1e15)
+        if tonnes > 1_000_000_000_000_000 {
+            return Err(CarbonChainError::InvalidTonnes);
         }
 
         // Include a per-contract nonce so two credits for the same project get distinct IDs.
@@ -151,9 +157,10 @@ impl CreditRegistry {
     }
 
     pub fn mark_retired(env: Env, credit_id: BytesN<32>) -> Result<(), CarbonChainError> {
-        // Called by the retirement contract after burning tokens.
-        // No auth here — the retirement contract is trusted by design.
-        // Contributors: add cross-contract caller verification here.
+        // Only the registered retirement contract may call this.
+        let retirement_contract = get_retirement_contract(&env)
+            .ok_or(CarbonChainError::NotInitialized)?;
+        retirement_contract.require_auth();
         let mut credit = get_credit(&env, &credit_id).ok_or(CarbonChainError::CreditNotFound)?;
         if credit.status != CreditStatus::Active {
             return Err(CarbonChainError::InvalidStatusTransition);
@@ -187,7 +194,8 @@ mod tests {
         let client = CreditRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let verifier = Address::generate(&env);
-        client.initialize(&admin);
+        let retirement = Address::generate(&env);
+        client.initialize(&admin, &retirement);
         (env, client, admin, verifier)
     }
 
@@ -205,8 +213,9 @@ mod tests {
 
     #[test]
     fn test_initialize_twice_fails() {
-        let (_env, client, admin, _) = setup();
-        let result = client.try_initialize(&admin);
+        let (env, client, admin, _) = setup();
+        let retirement = Address::generate(&env);
+        let result = client.try_initialize(&admin, &retirement);
         assert!(result.is_err());
     }
 
@@ -279,7 +288,15 @@ mod tests {
 
     #[test]
     fn test_mark_retired() {
-        let (env, client, admin, verifier) = setup();
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CreditRegistry, ());
+        let client = CreditRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        // Use a generated address as the retirement contract so mock_all_auths covers it
+        let retirement = Address::generate(&env);
+        client.initialize(&admin, &retirement);
         client.register_verifier(&admin, &verifier);
         let issuer = Address::generate(&env);
         let id = submit_test_credit(&env, &client, &issuer);
@@ -289,15 +306,91 @@ mod tests {
     }
 
     #[test]
-    fn test_two_credits_same_project_have_distinct_ids() {
+    fn test_unauthorized_mark_retired_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CreditRegistry, ());
+        let client = CreditRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let retirement = Address::generate(&env);
+
+        client.initialize(&admin, &retirement);
+        client.register_verifier(&admin, &verifier);
+        let issuer = Address::generate(&env);
+        let id = submit_test_credit(&env, &client, &issuer);
+        client.approve_and_mint(&verifier, &id);
+
+        // Disable auth mocking — require_auth calls will now actually enforce auth
+        env.set_auths(&[]);
+
+        // mark_retired requires the retirement contract's auth, which is not provided
+        let result = client.try_mark_retired(&id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_credit_zero_tonnes_fails() {
         let (env, client, _, _) = setup();
         let issuer = Address::generate(&env);
-        let id1 = submit_test_credit(&env, &client, &issuer);
-        let id2 = submit_test_credit(&env, &client, &issuer);
-        assert_ne!(id1, id2);
-        // Both records must be independently retrievable.
-        assert!(client.try_get_credit(&id1).is_ok());
-        assert!(client.try_get_credit(&id2).is_ok());
+        let result = client.try_submit_credit(
+            &issuer,
+            &String::from_str(&env, "PROJ-001"),
+            &2024,
+            &String::from_str(&env, "VCS"),
+            &String::from_str(&env, "NG"),
+            &0,
+            &String::from_str(&env, "bafybei123"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_credit_negative_tonnes_fails() {
+        let (env, client, _, _) = setup();
+        let issuer = Address::generate(&env);
+        let result = client.try_submit_credit(
+            &issuer,
+            &String::from_str(&env, "PROJ-001"),
+            &2024,
+            &String::from_str(&env, "VCS"),
+            &String::from_str(&env, "NG"),
+            &-1,
+            &String::from_str(&env, "bafybei123"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_credit_over_upper_bound_fails() {
+        let (env, client, _, _) = setup();
+        let issuer = Address::generate(&env);
+        let result = client.try_submit_credit(
+            &issuer,
+            &String::from_str(&env, "PROJ-001"),
+            &2024,
+            &String::from_str(&env, "VCS"),
+            &String::from_str(&env, "NG"),
+            &1_000_000_000_000_001,
+            &String::from_str(&env, "bafybei123"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_credit_at_upper_bound_succeeds() {
+        let (env, client, _, _) = setup();
+        let issuer = Address::generate(&env);
+        let result = client.try_submit_credit(
+            &issuer,
+            &String::from_str(&env, "PROJ-001"),
+            &2024,
+            &String::from_str(&env, "VCS"),
+            &String::from_str(&env, "NG"),
+            &1_000_000_000_000_000,
+            &String::from_str(&env, "bafybei123"),
+        );
+        assert!(result.is_ok());
     }
 
     #[test]

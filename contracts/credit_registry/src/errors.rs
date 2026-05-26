@@ -14,4 +14,5 @@ pub enum CarbonChainError {
     VerifierNotFound = 107,
     InsufficientBalance = 108,
     Overflow = 109,
+    InvalidTonnes = 110,
 }

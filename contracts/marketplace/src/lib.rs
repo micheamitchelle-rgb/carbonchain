@@ -114,14 +114,14 @@ impl Marketplace {
     }
 
     pub fn offer_count(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::OfferCount).unwrap_or(0u64)
+        env.storage().persistent().get(&DataKey::OfferCount).unwrap_or(0u64)
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
     fn next_id(env: &Env) -> u64 {
-        let id: u64 = env.storage().instance().get(&DataKey::OfferCount).unwrap_or(0u64);
-        env.storage().instance().set(&DataKey::OfferCount, &(id + 1));
+        let id: u64 = env.storage().persistent().get(&DataKey::OfferCount).unwrap_or(0u64);
+        env.storage().persistent().set(&DataKey::OfferCount, &(id + 1));
         id
     }
 }
@@ -208,5 +208,31 @@ mod tests {
         let offer_id = client.create_offer(&seller, &credit_id, &10_000_000, &500_000);
         let other = Address::generate(&env);
         assert!(client.try_cancel_offer(&other, &offer_id).is_err());
+    }
+
+    #[test]
+    fn test_offer_count_survives_contract_reinstantiation() {
+        // Simulates an upgrade: the same contract address is re-registered (instance storage
+        // is wiped) but persistent storage survives. OfferCount must still be correct.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(Marketplace, ());
+        let client = MarketplaceClient::new(&env, &contract_id);
+        let seller = Address::generate(&env);
+        let credit_id = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.create_offer(&seller, &credit_id, &10_000_000, &500_000);
+        client.create_offer(&seller, &credit_id, &20_000_000, &250_000);
+        assert_eq!(client.offer_count(), 2);
+
+        // Re-register the same contract (simulates upgrade wiping instance storage)
+        env.register_at(&contract_id, Marketplace, ());
+
+        // Persistent storage survives — count must still be 2
+        assert_eq!(client.offer_count(), 2);
+
+        // Next offer ID must not collide with existing ones
+        let new_offer_id = client.create_offer(&seller, &credit_id, &5_000_000, &100_000);
+        assert_eq!(new_offer_id, 2);
     }
 }
