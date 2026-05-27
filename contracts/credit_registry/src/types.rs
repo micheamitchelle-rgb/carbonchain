@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, String, BytesN};
+use soroban_sdk::{contracttype, Address, String, BytesN, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[contracttype]
@@ -9,11 +9,19 @@ pub enum CreditStatus {
     Flagged = 3,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[contracttype]
+pub enum ServiceType {
+    CreditApproval = 0,
+    MRVReview = 1,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub struct CreditMetadata {
     pub project_id: String,
     pub issuer: Address,
+    pub owner: Address,
     pub vintage_year: u32,
     pub methodology: String,
     pub geography: String,
@@ -33,4 +41,7 @@ pub enum DataKey {
     RetirementContract,
     CreditNonce,
     Paused,
+    VerifierServices(Address),
+    PendingAdmin,
+    Nonce(Address),
 }

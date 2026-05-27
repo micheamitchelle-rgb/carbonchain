@@ -16,7 +16,7 @@ use crate::storage::{
     set_retirement_contract, get_retirement_contract,
     set_paused, is_paused,
 };
-use crate::types::{CreditMetadata, CreditStatus, DataKey};
+use crate::types::{CreditMetadata, CreditStatus, DataKey, ServiceType};
 use crate::events::{
     credit_submitted, credit_minted, verifier_added, verifier_removed,
     contract_paused, contract_unpaused,
@@ -184,6 +184,7 @@ impl CreditRegistry {
         let metadata = CreditMetadata {
             project_id: project_id.clone(),
             issuer: issuer.clone(),
+            owner: issuer.clone(),
             vintage_year,
             methodology,
             geography,
@@ -300,6 +301,98 @@ impl CreditRegistry {
     pub fn is_verifier(env: Env, address: Address) -> bool {
         is_verifier(&env, &address)
     }
+
+    // ── Verifier Services ────────────────────────────────────────────────────
+
+    /// Replace all capabilities for a verifier. This overwrites any existing services.
+    pub fn configure_verifier_services(env: Env, admin: Address, verifier: Address, services: Vec<ServiceType>, nonce: u64) -> Result<(), CarbonChainError> {
+        let stored_admin = get_admin(&env).ok_or(CarbonChainError::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(CarbonChainError::Unauthorized);
+        }
+        if !consume_nonce(&env, &admin, nonce) {
+            return Err(CarbonChainError::InvalidNonce);
+        }
+        if !is_verifier(&env, &verifier) {
+            return Err(CarbonChainError::VerifierNotFound);
+        }
+        env.storage().persistent().set(&DataKey::VerifierServices(verifier), &services);
+        Ok(())
+    }
+
+    /// Add a single service to a verifier's capabilities.
+    pub fn add_verifier_service(env: Env, admin: Address, verifier: Address, service: ServiceType, nonce: u64) -> Result<(), CarbonChainError> {
+        let stored_admin = get_admin(&env).ok_or(CarbonChainError::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(CarbonChainError::Unauthorized);
+        }
+        if !consume_nonce(&env, &admin, nonce) {
+            return Err(CarbonChainError::InvalidNonce);
+        }
+        if !is_verifier(&env, &verifier) {
+            return Err(CarbonChainError::VerifierNotFound);
+        }
+        
+        let mut services: Vec<ServiceType> = env.storage().persistent()
+            .get(&DataKey::VerifierServices(verifier.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        if !services.contains(&service) {
+            services.push_back(service);
+            env.storage().persistent().set(&DataKey::VerifierServices(verifier), &services);
+        }
+        Ok(())
+    }
+
+    /// Remove a single service from a verifier's capabilities.
+    pub fn remove_verifier_service(env: Env, admin: Address, verifier: Address, service: ServiceType, nonce: u64) -> Result<(), CarbonChainError> {
+        let stored_admin = get_admin(&env).ok_or(CarbonChainError::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(CarbonChainError::Unauthorized);
+        }
+        if !consume_nonce(&env, &admin, nonce) {
+            return Err(CarbonChainError::InvalidNonce);
+        }
+        if !is_verifier(&env, &verifier) {
+            return Err(CarbonChainError::VerifierNotFound);
+        }
+        
+        let old_services: Vec<ServiceType> = env.storage().persistent()
+            .get(&DataKey::VerifierServices(verifier.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let mut new_services: Vec<ServiceType> = Vec::new(&env);
+        for s in old_services.iter() {
+            if s != service {
+                new_services.push_back(s);
+            }
+        }
+        env.storage().persistent().set(&DataKey::VerifierServices(verifier), &new_services);
+        Ok(())
+    }
+
+    pub fn get_verifier_services(env: Env, verifier: Address) -> Vec<ServiceType> {
+        env.storage().persistent()
+            .get(&DataKey::VerifierServices(verifier))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+}
+
+// ── Helper functions ─────────────────────────────────────────────────────────
+
+fn get_nonce(env: &Env, addr: &Address) -> u64 {
+    env.storage().persistent().get(&DataKey::Nonce(addr.clone())).unwrap_or(0u64)
+}
+
+fn consume_nonce(env: &Env, addr: &Address, expected: u64) -> bool {
+    let current = get_nonce(env, addr);
+    if current != expected { return false; }
+    let key = DataKey::Nonce(addr.clone());
+    env.storage().persistent().set(&key, &(current + 1));
+    true
 }
 
 #[cfg(test)]
@@ -647,5 +740,88 @@ mod tests {
         let (env, client, _, _) = setup();
         let rando = Address::generate(&env);
         assert!(client.try_pause(&rando).is_err());
+    }
+
+    #[test]
+    fn test_configure_verifier_services_replaces_all() {
+        let (_env, client, admin, verifier) = setup();
+        let nonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &nonce);
+        
+        let mut services = Vec::new(&_env);
+        services.push_back(ServiceType::CreditApproval);
+        services.push_back(ServiceType::MRVReview);
+        let nonce2 = client.get_nonce(&admin);
+        client.configure_verifier_services(&admin, &verifier, &services, &nonce2);
+        
+        let retrieved = client.get_verifier_services(&verifier);
+        assert_eq!(retrieved.len(), 2);
+        
+        // Replace with single service - should overwrite all
+        let mut new_services = Vec::new(&_env);
+        new_services.push_back(ServiceType::CreditApproval);
+        let nonce3 = client.get_nonce(&admin);
+        client.configure_verifier_services(&admin, &verifier, &new_services, &nonce3);
+        
+        let retrieved2 = client.get_verifier_services(&verifier);
+        assert_eq!(retrieved2.len(), 1);
+        assert_eq!(retrieved2.get(0).unwrap(), ServiceType::CreditApproval);
+    }
+
+    #[test]
+    fn test_add_verifier_service() {
+        let (_env, client, admin, verifier) = setup();
+        let nonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &nonce);
+        
+        let nonce2 = client.get_nonce(&admin);
+        client.add_verifier_service(&admin, &verifier, &ServiceType::CreditApproval, &nonce2);
+        
+        let services = client.get_verifier_services(&verifier);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services.get(0).unwrap(), ServiceType::CreditApproval);
+        
+        // Add another service
+        let nonce3 = client.get_nonce(&admin);
+        client.add_verifier_service(&admin, &verifier, &ServiceType::MRVReview, &nonce3);
+        
+        let services2 = client.get_verifier_services(&verifier);
+        assert_eq!(services2.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_verifier_service() {
+        let (_env, client, admin, verifier) = setup();
+        let nonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &nonce);
+        
+        // Add both services
+        let nonce2 = client.get_nonce(&admin);
+        client.add_verifier_service(&admin, &verifier, &ServiceType::CreditApproval, &nonce2);
+        let nonce3 = client.get_nonce(&admin);
+        client.add_verifier_service(&admin, &verifier, &ServiceType::MRVReview, &nonce3);
+        
+        // Remove one service
+        let nonce4 = client.get_nonce(&admin);
+        client.remove_verifier_service(&admin, &verifier, &ServiceType::CreditApproval, &nonce4);
+        
+        let services = client.get_verifier_services(&verifier);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services.get(0).unwrap(), ServiceType::MRVReview);
+    }
+
+    #[test]
+    fn test_add_duplicate_service_ignored() {
+        let (_env, client, admin, verifier) = setup();
+        let nonce = client.get_nonce(&admin);
+        client.register_verifier(&admin, &verifier, &nonce);
+        
+        let nonce2 = client.get_nonce(&admin);
+        client.add_verifier_service(&admin, &verifier, &ServiceType::CreditApproval, &nonce2);
+        let nonce3 = client.get_nonce(&admin);
+        client.add_verifier_service(&admin, &verifier, &ServiceType::CreditApproval, &nonce3);
+        
+        let services = client.get_verifier_services(&verifier);
+        assert_eq!(services.len(), 1);
     }
 }
